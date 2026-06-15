@@ -1,0 +1,190 @@
+import pymysql
+import pymysql.cursors
+from datetime import datetime, timedelta
+from config.config import DB_CONFIG
+
+def get_db_connection():
+    return pymysql.connect(**DB_CONFIG)
+
+def get_data_from_db(keyword, ttl_hours=24):
+    """Lấy dữ liệu từ DB nếu còn trong thời hạn TTL (mặc định 24 giờ).
+    Nếu dữ liệu đã quá ttl_hours thì trả về [] để buộc cào lại."""
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        # Chỉ lấy dữ liệu còn trong thời hạn TTL (cache chưa hết hạn)
+        cutoff_time = datetime.now() - timedelta(hours=ttl_hours)
+        sql    = "SELECT *, created_at FROM search_history WHERE LOWER(keyword) = LOWER(%s) AND created_at >= %s ORDER BY raw_price ASC"
+        cursor.execute(sql, (keyword.strip(), cutoff_time))
+        rows = cursor.fetchall()
+
+        # LỌC TRÙNG LẶP TỪ DATABASE (Do nhiều user cùng search 1 từ khóa)
+        seen = set()
+        unique_rows = []
+        for r in rows:
+            # Tạo khóa nhận dạng: Sàn + Tên + Giá
+            identifier = (r['site'], r['title'], r['raw_price'])
+            if identifier not in seen:
+                seen.add(identifier)
+                unique_rows.append(r)
+
+        return unique_rows
+        
+    except Exception as e:
+        print(f"Lỗi get_data_from_db: {e}")
+        return []
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+
+def save_to_db(keyword, products, user_id=None):
+    """Lưu kết quả cào kèm theo user_id để quản lý lịch sử theo tài khoản."""
+    if not products:
+        return
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Xóa dữ liệu cũ của từ khóa này (chỉ xóa của user hiện tại hoặc guest)
+        if user_id:
+            cursor.execute("DELETE FROM search_history WHERE LOWER(keyword) = LOWER(%s) AND user_id = %s", (keyword.strip(), user_id))
+        else:
+            cursor.execute("DELETE FROM search_history WHERE LOWER(keyword) = LOWER(%s) AND user_id IS NULL", (keyword.strip(),))
+        
+        # Thêm user_id vào câu lệnh INSERT
+        sql = """INSERT INTO search_history 
+                 (keyword, user_id, site, title, price_str, raw_price, img, link) 
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s)"""
+        
+        for p in products:
+            cursor.execute(sql, (
+                keyword.strip(), 
+                user_id, 
+                p.get('site', 'Unknown'), 
+                p.get('title', ''),
+                p.get('price_str', ''), 
+                p.get('raw_price', 0), 
+                p.get('img', ''), 
+                p.get('link', '')
+            ))
+        conn.commit()
+    except Exception as e:
+        print(f"Lỗi save_to_db: {e}")
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+
+def init_extra_tables():
+    """Tạo và cập nhật cấu trúc các bảng."""
+    try:
+        conn   = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. Bảng Users 
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(80) UNIQUE NOT NULL,
+                email VARCHAR(120) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                is_admin TINYINT(1) DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+        # 2. Bảng Search History (Tạo mới nếu chưa có)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS search_history (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NULL,
+                keyword VARCHAR(255),
+                site VARCHAR(50),
+                title TEXT,
+                price_str VARCHAR(100),
+                raw_price BIGINT,
+                img TEXT,
+                link TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        
+        # Cập nhật cột user_id cho bảng search_history nếu bảng cũ đã tồn tại mà chưa có cột này
+        try:
+            cursor.execute("ALTER TABLE search_history ADD COLUMN user_id INT NULL")
+            cursor.execute("ALTER TABLE search_history ADD FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL")
+        except Exception:
+            pass # Bỏ qua nếu cột đã tồn tại
+
+        # 3. Bảng Cart
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cart (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                title TEXT, price_str VARCHAR(100),
+                img TEXT, link TEXT, site VARCHAR(50),
+                quantity INT DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+        # 4. Bảng Orders
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                product_name TEXT, 
+                price VARCHAR(200),
+                payment_method VARCHAR(50) DEFAULT 'COD',
+                fullname VARCHAR(100),
+                phone VARCHAR(20),
+                email VARCHAR(120),
+                address TEXT,
+                status VARCHAR(20) DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+
+        # 5. Các bảng khác (Favorites, Comments)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                title TEXT, price_str VARCHAR(100),
+                img TEXT, link TEXT, site VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS comments (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id INT NOT NULL,
+                product_title TEXT, content TEXT, rating INT DEFAULT 5,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        """)
+        
+        conn.commit()
+        print("✅ Database đã được khởi tạo và nâng cấp thành công!")
+    except Exception as e:
+        print(f"[init_extra_tables] Error: {e}")
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+
+def get_suggestions(query):
+    """Lấy gợi ý từ lịch sử tìm kiếm chung."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        sql = "SELECT DISTINCT keyword FROM search_history WHERE keyword LIKE %s LIMIT 8"
+        cursor.execute(sql, (f"%{query}%",))
+        results = cursor.fetchall()
+        return [r['keyword'] for r in results]
+    except Exception:
+        return []
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
